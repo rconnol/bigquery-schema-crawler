@@ -170,13 +170,14 @@ class SchemaGenerator:
         file is processed without a try-except block and any exception will be
         allowed to escape to the calling routine.
         """
+        if self.input_format not in {'csv', 'json', None}:
+            raise Exception("Unknown input_format '%s'" % self.input_format)
 
         if self.input_format == 'csv':
             reader = csv.DictReader(file)
-        elif self.input_format == 'json' or self.input_format is None:
+
+        if self.input_format == 'json' or self.input_format is None:
             reader = json_reader(file)
-        else:
-            raise Exception("Unknown input_format '%s'" % self.input_format)
 
         schema_map = OrderedDict()
         try:
@@ -424,55 +425,62 @@ class SchemaGenerator:
         Note that primitive types do not have the string '__' in the returned
         type string, which is a useful marker.
         """
-        if isinstance(value, str):
-            if self.TIMESTAMP_MATCHER.match(value):
-                return 'TIMESTAMP'
-            elif self.DATE_MATCHER.match(value):
-                return 'DATE'
-            elif self.TIME_MATCHER.match(value):
-                return 'TIME'
-            elif not self.quoted_values_are_strings:
-                # Implement the same type inference algorithm as 'bq load' for
-                # quoted values that look like ints, floats or bools.
-                if self.INTEGER_MATCHER.match(value):
-                    if int(value) < self.INTEGER_MIN_VALUE or \
-                        self.INTEGER_MAX_VALUE < int(value):
-                        return 'QFLOAT'  # quoted float
-                    else:
-                        return 'QINTEGER'  # quoted integer
-                elif self.FLOAT_MATCHER.match(value):
-                    return 'QFLOAT'  # quoted float
-                elif value.lower() in ['true', 'false']:
-                    return 'QBOOLEAN'  # quoted boolean
-                else:
-                    return 'STRING'
-            else:
-                return 'STRING'
-        # Python 'bool' is a subclass of 'int' so we must check it first
-        elif isinstance(value, bool):
-            return 'BOOLEAN'
-        elif isinstance(value, int):
-            if value < self.INTEGER_MIN_VALUE or self.INTEGER_MAX_VALUE < value:
-                return 'FLOAT'
-            else:
-                return 'INTEGER'
-        elif isinstance(value, float):
-            return 'FLOAT'
-        elif value is None:
-            return '__null__'
-        elif isinstance(value, dict):
-            if value:
-                return 'RECORD'
-            else:
-                return '__empty_record__'
-        elif isinstance(value, list):
-            if value:
-                return '__array__'
-            else:
-                return '__empty_array__'
-        else:
-            raise Exception(
-                'Unsupported node type: %s (should not happen)' % type(value))
+        type_functions = {
+            str: self._evaluate_str,
+            bool: lambda x: 'BOOL',
+            int: lambda x: 'INTEGER' if self._is_int64(x) else 'FLOAT',
+            float: lambda x: 'FLOAT',
+            dict: lambda x: 'RECORD' if x else '__empty_record__',
+            list: lambda x: '__array__' if value else '__empty_array__',
+            type(None): lambda x: '__null__',
+        }
+        _type = type(value)
+
+        if _type not in type_functions:
+            raise Exception('Unsupported node type: %s (should not happen)' % type(value))
+
+        return type_functions[_type](value)
+
+    def _evaluate_str(self, value):
+        """Private method used by infer_value_type
+        to convert python str primitive to corresponding
+        bigquery type.
+
+        Arguments:
+            value (str): python primitive for inspection
+        Returns (str): the inferred bigquery type
+        """
+        if self.TIMESTAMP_MATCHER.match(value):
+            return 'TIMESTAMP'
+        
+        if self.DATE_MATCHER.match(value):
+            return 'DATE'
+        
+        if self.TIME_MATCHER(value):
+            return 'TIME'
+
+        # Bail out here if quoted_value_are_strings is true
+        # will not try to infer INT, FLOAT, or BOOL types
+        if self.quoted_values_are_strings:
+            return 'STRING'
+
+        if self.INTEGER_MATCHER.match(value):
+            return 'QINTEGER' if self._is_int64(int(value)) else 'QFLOAT' 
+
+        if self.FLOAT_MATCHER.match(value):
+            return 'QFLOAT'
+        
+        if value.lower() in {'true', 'false'}:
+            return 'QBOOLEAN'
+        
+        return 'STRING'
+
+    @staticmethod
+    def _is_between(x, _min, _max):
+        return _min < x < _max
+    
+    def _is_int64(self, x):
+        return self._is_between(x, self.INTEGER_MIN_VALUE, self.INTEGER_MAX_VALUE)
 
     def infer_array_type(self, elements):
         """Return the type of all the array elements, accounting for the same
@@ -645,7 +653,7 @@ def flatten_schema_map(schema_map,
     schema = []
     map_items = sorted(schema_map.items()) if sorted_schema \
         else schema_map.items()
-    for name, meta in map_items:
+    for _name, meta in map_items:
         # Skip over fields which have been explicitly removed
         if not meta: continue
 
